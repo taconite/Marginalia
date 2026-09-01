@@ -3,7 +3,7 @@ import { SettingsPanelType } from '@/components/settings/SettingsDialog';
 import { RiFontSize, RiDashboardLine } from 'react-icons/ri';
 import { VscSymbolColor } from 'react-icons/vsc';
 import { LiaHandPointerSolid } from 'react-icons/lia';
-import { PiRobot, PiSun, PiMoon } from 'react-icons/pi';
+import { PiSun, PiMoon } from 'react-icons/pi';
 import { TbSunMoon } from 'react-icons/tb';
 import { MdRefresh } from 'react-icons/md';
 import { IconType } from 'react-icons';
@@ -150,7 +150,6 @@ const panelIcons: Record<SettingsPanelType, IconType> = {
   Layout: RiDashboardLine,
   Color: VscSymbolColor,
   Control: LiaHandPointerSolid,
-  AI: PiRobot,
 };
 
 // font panel items

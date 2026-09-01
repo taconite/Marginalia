@@ -55,8 +55,8 @@ export const annotationToolButtons = createAnnotationToolButtons([
   },
   {
     type: 'chat',
-    label: _('Ask AI'),
-    tooltip: _('Send selection to AI chat'),
+    label: _('Ask Pi'),
+    tooltip: _('Send selection to Pi'),
     Icon: LuMessageSquareText,
     quickAction: true,
   },

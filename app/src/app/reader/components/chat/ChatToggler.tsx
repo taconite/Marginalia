@@ -22,7 +22,7 @@ const ChatToggler: React.FC = () => {
         />
       }
       onClick={togglePanel}
-      label={_('AI Chat')}
+      label={_('Ask Pi')}
     />
   );
 };

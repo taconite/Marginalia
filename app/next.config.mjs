@@ -14,7 +14,6 @@ const nextConfig = {
   devIndicators: false,
   assetPrefix: '',
   reactStrictMode: true,
-  serverExternalPackages: ['@mariozechner/pi-ai', '@mariozechner/pi-agent-core', '@anthropic-ai/sdk'],
   webpack: (config) => {
     config.resolve.alias = {
       ...config.resolve.alias,

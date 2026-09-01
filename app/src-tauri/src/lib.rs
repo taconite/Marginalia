@@ -7,6 +7,7 @@ use tauri_plugin_fs::FsExt;
 use tauri::{Listener, Url};
 
 mod dir_scanner;
+mod pi_bridge;
 
 use tauri::{Emitter, WebviewUrl, WebviewWindowBuilder};
 
@@ -87,35 +88,26 @@ fn set_window_open_with_files(app: &AppHandle, files: Vec<PathBuf>) {
 }
 
 #[tauri::command]
-fn get_environment_variable(name: &str) -> String {
-    std::env::var(String::from(name)).unwrap_or(String::from(""))
-}
-
-#[tauri::command]
-fn read_keychain_item(service: String) -> Result<String, String> {
-    let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", &service, "-w"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err("Item not found".to_string())
-    }
-}
-
-#[tauri::command]
-fn read_file_contents(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 fn get_executable_dir() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(|p| p.to_path_buf()))
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default()
+}
+
+#[tauri::command]
+async fn list_pi_sessions() -> Result<Vec<pi_bridge::PiSession>, String> {
+    tauri::async_runtime::spawn_blocking(pi_bridge::list_pi_sessions)
+        .await
+        .map_err(|error| format!("Failed to inspect Pi sessions: {error}"))?
+}
+
+#[tauri::command]
+async fn send_pi_prompt(socket_path: String, message: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || pi_bridge::send_pi_prompt(&socket_path, &message))
+        .await
+        .map_err(|error| format!("Failed to contact Pi: {error}"))?
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -136,11 +128,10 @@ pub fn run() {
         )
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
-            get_environment_variable,
             get_executable_dir,
-            read_keychain_item,
-            read_file_contents,
             dir_scanner::read_dir,
+            list_pi_sessions,
+            send_pi_prompt,
         ])
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_persisted_scope::init())

@@ -5,7 +5,7 @@ import Providers from '@/components/Providers';
 
 import '../styles/globals.css';
 
-const title = 'Marginalia — Read with AI';
+const title = 'Marginalia — Read with Pi';
 const description =
   'Marginalia is an ebook reader for immersive and organized reading. ' +
   'Enjoy seamless access to your digital library, powerful tools for highlighting, bookmarking, ' +

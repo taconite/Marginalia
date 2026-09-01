@@ -25,14 +25,6 @@
       ]
     },
     {
-      "identifier": "fs:scope",
-      "allow": [
-        {
-          "path": "$HOME/.codex/auth.json"
-        }
-      ]
-    },
-    {
       "identifier": "fs:scope-appdata-recursive",
       "allow": [
         {

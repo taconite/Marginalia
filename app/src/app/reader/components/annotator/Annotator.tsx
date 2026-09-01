@@ -664,9 +664,9 @@ const Annotator: React.FC<{ bookKey: string }> = ({ bookKey }) => {
       selectedText: selection.text,
       surroundingText,
       chapterTitle,
-      chapterText: '', // Full chapter text injected via system prompt
       bookTitle: book?.title || '',
       bookAuthor: book?.author || '',
+      page: progress?.page ?? null,
     });
     useChatStore.getState().setOpen(true);
   };

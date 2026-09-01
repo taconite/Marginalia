@@ -4,95 +4,76 @@
 
 # Marginalia
 
-A desktop ebook reader with a built-in AI companion.
+A desktop ebook and PDF reader connected to an existing Pi session in Neovim.
 
-> _Marginalia (n.) — notes, comments, and annotations made in the margins of a book; from Latin marginalis, "of the margin."_
+> _Marginalia (n.) — notes, comments, and annotations made in the margins of a
+> book; from Latin marginalis, "of the margin."_
 
-<p align="center">
-  <img src="docs/screenshot-reader.png" alt="Marginalia showing an ebook chapter on attention mechanisms with the AI chat sidebar open">
-</p>
-
-<table>
-  <tr>
-    <td><img src="docs/screenshot-highlight-text.png" alt="Selecting a code passage with the highlight and annotation toolbar"></td>
-    <td><img src="docs/screenshot-highlight-chat.png" alt="Asking a question about a highlighted code snippet and receiving a TensorFlow equivalent from Claude"></td>
-  </tr>
-</table>
-
-## What it does
-
-I built this to aid in reading technical books, where I find I constantly wish to stop and ask questions about the material. Inspired by Andrej Karpathy's [reader3](https://github.com/karpathy/reader3). Select a passage, ask a question, and have an ongoing conversation about it without leaving the page.
-
-Marginalia combines a slimmed-down fork of [Readest](https://github.com/readest/readest) (an open-source ebook reader) with [Pi](https://github.com/badlogic/pi-mono) (an AI agent framework) into a single desktop app. Read on the left, chat on the right. The AI knows what book you're reading, what chapter you're in, and has the full chapter text as context.
+This fork keeps Marginalia's document reader and annotation interface while
+moving agent conversations into Pi. Marginalia sends selected text and bounded
+reading context over pi.nvim's local Unix socket; Pi owns the conversation,
+model, tools, extensions, and responses.
 
 ## Features
 
 Reading:
 
-- EPUB, PDF, MOBI, AZW/AZW3, FB2, CBZ, TXT, Markdown
-- Page and scroll mode
-- Highlights, bookmarks, annotations
-- Export annotations as Markdown
-- Full-text search
-- Dark/light/auto theme
-- Customizable fonts, margins, layout
+- EPUB, PDF, MOBI, AZW/AZW3, FB2, CBZ, TXT, and Markdown
+- Page and scroll modes
+- Highlights, bookmarks, annotations, and Markdown export
+- Full-text search and configurable presentation
 
-AI chat:
+Pi integration:
 
-- Collapsible sidebar panel
-- Select text, click "Ask AI" to discuss it
-- Full chapter text included as context
-- Multiple conversations per book, persisted across sessions
-- Web search for real-world context beyond the book
-- Claude Opus 4.6, Claude Sonnet 4.6 (via Claude Code Max)
-- GPT-5.4 (via Codex CLI)
-- Auto-loads auth tokens from Claude Code and Codex CLI
+- Select text and choose **Ask Pi**
+- Explicitly select a live Pi session by working directory and PID
+- Send the document title, author, section, page, selected text, surrounding
+  text, and question
+- Continue the conversation in the existing Pi terminal in Neovim
+- Keep provider credentials and agent configuration out of Marginalia
 
-## How it works
+## Requirements
 
-The app piggybacks on your existing Claude Code and Codex CLI credentials — no separate API keys needed. Open a book, open the chat panel, and start asking questions.
+- Linux or macOS
+- The socket-bridge build in `~/Tools/pi-nvim`, with a live Pi session
 
-Credentials are loaded from:
-
-- **Claude Code** — macOS Keychain (service `Claude Code-credentials`)
-- **Codex CLI** — `~/.codex/auth.json`
-
-If you get a 401, make sure you've authenticated first (`claude auth login` / `codex auth`).
-
-## Installation
-
-### Homebrew (Recommended)
+Start Pi with `:PiSession` in Neovim. Alternatively, start Pi manually with
+pi.nvim's bridge extension:
 
 ```bash
-brew install eddmann/tap/marginalia
+pi --extension /path/to/pi-nvim/extension.ts
 ```
 
-### Manual Download
-
-Download the latest release from [GitHub Releases](https://github.com/eddmann/Marginalia/releases):
-
-- **macOS:** `.dmg` (Apple Silicon and Intel)
-- **Linux:** `.AppImage` or `.deb`
+Open the **Ask Pi** panel in Marginalia, refresh the session list, and select the
+intended session. Marginalia never falls back to a different session if that
+selection disconnects.
 
 ## Development
 
 Requires Rust, Node.js 20+, and pnpm.
 
+```bash
+make install
+make dev
+make build
+make lint
+make fmt
 ```
-make install   # Install all dependencies
-make dev       # Start development server
-make build     # Build production app
-make lint      # Run all linting
-make fmt       # Format all code
-make clean     # Remove all build artifacts
-```
+
+The Pi adapter is deliberately separated by process and protocol:
+
+- Marginalia owns document rendering and context extraction.
+- Its Tauri backend discovers and connects to pi.nvim's private Unix sockets.
+- pi.nvim receives its existing newline-delimited `prompt` request and requires
+  no source changes.
 
 ## Built with
 
 - [Readest](https://github.com/readest/readest) — ebook reader
-- [Pi](https://github.com/badlogic/pi-mono) — AI agent framework
+- [Foliate](https://github.com/johnfactotum/foliate-js) and PDF.js — document rendering
+- [Pi](https://github.com/badlogic/pi-mono) and pi.nvim — agent conversation
 - [Tauri v2](https://tauri.app) — native desktop runtime
 
 ## License
 
-AGPL-3.0 — same as [Readest](https://github.com/readest/readest), from which this project is forked.
+AGPL-3.0 — same as Readest and upstream Marginalia.

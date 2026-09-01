@@ -59,7 +59,6 @@ import { handleA11yNavigation } from '@/utils/a11y';
 import { isCJKLang } from '@/utils/lang';
 import { getLocale } from '@/utils/misc';
 import { isFontType } from '@/utils/font';
-import { extractChapterText, findTopLevelAncestor } from '@/services/chapterExtraction';
 import Spinner from '@/components/Spinner';
 import ImageViewer from './ImageViewer';
 import TableViewer from './TableViewer';
@@ -99,7 +98,6 @@ const FoliateViewer: React.FC<{
   const [loading, setLoading] = useState(false);
   const [scrollMargins, setScrollMargins] = useState({ top: 0, bottom: 0 });
   const docLoaded = useRef(false);
-  const lastChapterHref = useRef('');
 
   useAutoFocus<HTMLDivElement>({ ref: containerRef });
 
@@ -127,36 +125,15 @@ const FoliateViewer: React.FC<{
       detail.range,
     );
 
-    // Update chat store with current chapter context
-    try {
-      const bookData = getBookData(bookKey);
-      const chapterTitle = detail.tocItem?.label || '';
-      const bookTitle = bookData?.book?.title || '';
-      const bookAuthor = bookData?.book?.author || '';
-
-      // Resolve to top-level chapter so we cache at chapter granularity,
-      // not subsection — navigating between 5.1 and 5.2 won't re-extract
-      const toc = bookDoc.toc ?? [];
-      const topLevel = detail.tocItem ? findTopLevelAncestor(toc, detail.tocItem) : null;
-      const chapterHref = topLevel?.href || detail.tocItem?.href || '';
-
-      // Only re-extract when the top-level chapter actually changes
-      if (chapterHref && chapterHref !== lastChapterHref.current) {
-        lastChapterHref.current = chapterHref;
-        // Update immediately with title (text arrives async)
-        useChatStore.getState().updateBookContext(bookTitle, bookAuthor, chapterTitle, '');
-        // Extract full chapter text asynchronously via createDocument()
-        extractChapterText(bookDoc, detail.tocItem, toc).then((text) => {
-          useChatStore.getState().updateBookContext(bookTitle, bookAuthor, chapterTitle, text);
-        });
-      } else {
-        // Same chapter — just update metadata
-        const { currentChapterText } = useChatStore.getState();
-        useChatStore.getState().updateBookContext(bookTitle, bookAuthor, chapterTitle, currentChapterText);
-      }
-    } catch {
-      // Best-effort context extraction
-    }
+    const book = getBookData(bookKey)?.book;
+    useChatStore.getState().updateBookContext(
+      book?.title || '',
+      book?.author || '',
+      detail.tocItem?.label || '',
+      _bookData?.isFixedLayout
+        ? (detail.section as PageInfo).current + 1
+        : currentPage + 1,
+    );
   };
 
   const getDocTransformHandler = ({ width, height }: { width: number; height: number }) => {

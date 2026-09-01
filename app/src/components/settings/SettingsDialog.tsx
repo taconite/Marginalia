@@ -26,8 +26,7 @@ export type SettingsPanelType =
   | 'Font'
   | 'Layout'
   | 'Color'
-  | 'Control'
-  | 'AI';
+  | 'Control';
 export type SettingsPanelPanelProp = {
   bookKey: string;
   onRegisterReset: (resetFn: () => void) => void;
@@ -111,7 +110,6 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
     Layout: null,
     Color: null,
     Control: null,
-    AI: null,
   });
 
   const registerResetFunction = (panel: SettingsPanelType, resetFn: () => void) => {
@@ -141,7 +139,6 @@ const SettingsDialog: React.FC<{ bookKey: string }> = ({ bookKey }) => {
         layout: 'Layout',
         color: 'Color',
         control: 'Control',
-        ai: 'AI',
       };
       const panelKey = parts[1]?.toLowerCase();
       const targetPanel = panelMap[panelKey || ''];
