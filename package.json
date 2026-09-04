@@ -16,9 +16,9 @@
   "packageManager": "pnpm@10.29.2",
   "type": "module",
   "scripts": {
-    "dev": "cd app && pnpm dev",
-    "tauri-dev": "cd app && pnpm tauri dev",
-    "build": "cd app && pnpm build",
-    "tauri-build": "cd app && pnpm tauri build"
+    "dev": "cd app && \"$npm_execpath\" run dev",
+    "tauri-dev": "cd app && \"$npm_execpath\" run tauri dev",
+    "build": "cd app && \"$npm_execpath\" run build",
+    "tauri-build": "cd app && \"$npm_execpath\" run tauri build"
   }
 }

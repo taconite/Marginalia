@@ -17,21 +17,46 @@ pub fn send_pi_prompt(socket_path: &str, message: &str) -> Result<(), String> {
     platform::send_pi_prompt(socket_path, message)
 }
 
+pub fn subscribe_pi_messages<F>(
+    subscription_id: &str,
+    socket_path: &str,
+    on_event: F,
+) -> Result<(), String>
+where
+    F: FnMut(serde_json::Value) -> Result<(), String>,
+{
+    platform::subscribe_pi_messages(subscription_id, socket_path, on_event)
+}
+
+pub fn reserve_pi_subscription(subscription_id: &str) -> Result<(), String> {
+    platform::reserve_pi_subscription(subscription_id)
+}
+
+pub fn unsubscribe_pi_messages(subscription_id: &str) -> Result<(), String> {
+    platform::unsubscribe_pi_messages(subscription_id)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod platform {
     use super::PiSession;
     use serde::Deserialize;
     use serde_json::{json, Value};
+    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::fs::{self, Metadata};
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read as _, Write};
+    use std::net::Shutdown;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
     const MAX_INFO_BYTES: u64 = 64 * 1024;
+    const MAX_STREAM_EVENT_BYTES: usize = 4 * 1024 * 1024;
     const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
+
+    static SUBSCRIPTIONS: OnceLock<Mutex<HashMap<String, Option<UnixStream>>>> = OnceLock::new();
 
     #[derive(Deserialize)]
     struct SessionInfo {
@@ -67,6 +92,187 @@ mod platform {
             &socket_path,
             &json!({ "type": "prompt", "message": message }),
         )
+    }
+
+    pub fn subscribe_pi_messages<F>(
+        subscription_id: &str,
+        socket_path: &str,
+        on_event: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(Value) -> Result<(), String>,
+    {
+        if subscription_id.trim().is_empty() {
+            return Err("Subscription ID cannot be empty".to_string());
+        }
+
+        let result = (|| {
+            let runtime_dir = runtime_dir();
+            validate_runtime_dir(&runtime_dir)?;
+            let info_dir = runtime_dir.join("sockets");
+            validate_info_dir(&info_dir)?;
+
+            let socket_path = PathBuf::from(socket_path);
+            validate_session_socket(&info_dir, &socket_path)?;
+            subscribe_request(subscription_id, &socket_path, on_event)
+        })();
+        if result.is_err() {
+            let _ = unsubscribe_pi_messages(subscription_id);
+        }
+        result
+    }
+
+    pub fn reserve_pi_subscription(subscription_id: &str) -> Result<(), String> {
+        if subscription_id.trim().is_empty() {
+            return Err("Subscription ID cannot be empty".to_string());
+        }
+        let mut subscriptions = subscriptions()
+            .lock()
+            .map_err(|_| "Pi subscription registry is unavailable".to_string())?;
+        if subscriptions.contains_key(subscription_id) {
+            return Err("Pi subscription already exists".to_string());
+        }
+        subscriptions.insert(subscription_id.to_string(), None);
+        Ok(())
+    }
+
+    pub fn unsubscribe_pi_messages(subscription_id: &str) -> Result<(), String> {
+        let stream = subscriptions()
+            .lock()
+            .map_err(|_| "Pi subscription registry is unavailable".to_string())?
+            .remove(subscription_id)
+            .flatten();
+        if let Some(stream) = stream {
+            stream
+                .shutdown(Shutdown::Both)
+                .map_err(|error| format!("Cannot close Pi subscription: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn subscriptions() -> &'static Mutex<HashMap<String, Option<UnixStream>>> {
+        SUBSCRIPTIONS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn subscribe_request<F>(
+        subscription_id: &str,
+        socket_path: &Path,
+        mut on_event: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(Value) -> Result<(), String>,
+    {
+        if !subscription_exists(subscription_id)? {
+            return Ok(());
+        }
+
+        let result = subscribe_request_inner(subscription_id, socket_path, &mut on_event);
+        let _ = unsubscribe_pi_messages(subscription_id);
+        result
+    }
+
+    fn subscribe_request_inner<F>(
+        subscription_id: &str,
+        socket_path: &Path,
+        on_event: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(Value) -> Result<(), String>,
+    {
+        let mut stream = UnixStream::connect(socket_path)
+            .map_err(|error| format!("Cannot connect to Pi: {error}"))?;
+        stream
+            .set_read_timeout(Some(SOCKET_TIMEOUT))
+            .map_err(|error| format!("Cannot configure Pi socket: {error}"))?;
+        stream
+            .set_write_timeout(Some(SOCKET_TIMEOUT))
+            .map_err(|error| format!("Cannot configure Pi socket: {error}"))?;
+
+        serde_json::to_writer(&mut stream, &json!({ "type": "subscribe" }))
+            .map_err(|error| format!("Cannot encode Pi request: {error}"))?;
+        stream
+            .write_all(b"\n")
+            .map_err(|error| format!("Cannot send request to Pi: {error}"))?;
+        stream
+            .flush()
+            .map_err(|error| format!("Cannot flush request to Pi: {error}"))?;
+
+        let cancel_stream = stream
+            .try_clone()
+            .map_err(|error| format!("Cannot prepare Pi subscription: {error}"))?;
+        {
+            let mut subscriptions = subscriptions()
+                .lock()
+                .map_err(|_| "Pi subscription registry is unavailable".to_string())?;
+            let Some(slot) = subscriptions.get_mut(subscription_id) else {
+                return Ok(());
+            };
+            *slot = Some(cancel_stream);
+        }
+
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        let mut acknowledged = false;
+        loop {
+            response_line.clear();
+            let bytes = match reader
+                .by_ref()
+                .take((MAX_STREAM_EVENT_BYTES + 1) as u64)
+                .read_line(&mut response_line)
+            {
+                Ok(bytes) => bytes,
+                Err(_) if !subscription_exists(subscription_id)? => return Ok(()),
+                Err(error) => return Err(format!("Cannot read Pi response: {error}")),
+            };
+            if bytes == 0 {
+                if !subscription_exists(subscription_id)? {
+                    return Ok(());
+                }
+                return Err("Pi closed the response stream unexpectedly".to_string());
+            }
+            if response_line.len() > MAX_STREAM_EVENT_BYTES {
+                return Err("Pi response event is too large".to_string());
+            }
+
+            let event: Value = serde_json::from_str(&response_line)
+                .map_err(|error| format!("Pi returned invalid JSON: {error}"))?;
+            if !acknowledged {
+                let response: SocketResponse = serde_json::from_value(event)
+                    .map_err(|error| format!("Pi returned an invalid acknowledgement: {error}"))?;
+                if !response.ok {
+                    return Err(response
+                        .error
+                        .unwrap_or_else(|| "Pi rejected the request".to_string()));
+                }
+                acknowledged = true;
+                reader
+                    .get_ref()
+                    .set_read_timeout(None)
+                    .map_err(|error| format!("Cannot configure Pi subscription: {error}"))?;
+                on_event(json!({ "type": "subscribed" }))?;
+                continue;
+            }
+
+            match event.get("type").and_then(Value::as_str) {
+                Some("assistant") => on_event(event)?,
+                Some("closed") => return Ok(()),
+                Some("error") => {
+                    return Err(event
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Pi could not complete the request")
+                        .to_string());
+                }
+                _ => return Err("Pi returned an unsupported response event".to_string()),
+            }
+        }
+    }
+
+    fn subscription_exists(subscription_id: &str) -> Result<bool, String> {
+        Ok(subscriptions()
+            .lock()
+            .map_err(|_| "Pi subscription registry is unavailable".to_string())?
+            .contains_key(subscription_id))
     }
 
     fn runtime_dir() -> PathBuf {
@@ -237,8 +443,10 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::io::Read;
         use std::os::unix::net::UnixListener;
         use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
         use std::thread;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -356,18 +564,171 @@ mod platform {
             server.join().expect("join server");
             fs::remove_dir_all(runtime_dir).expect("remove test runtime");
         }
+
+        #[test]
+        fn subscribes_to_assistant_messages_until_the_session_closes() {
+            let socket_path = test_runtime_dir().join("stream.sock");
+            fs::create_dir_all(socket_path.parent().expect("stream parent"))
+                .expect("create stream parent");
+            let listener = UnixListener::bind(&socket_path).expect("bind stream socket");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().expect("clone stream"))
+                    .read_line(&mut request)
+                    .expect("read request");
+                let value: Value = serde_json::from_str(&request).expect("decode request");
+                assert_eq!(value, json!({ "type": "subscribe" }));
+                stream
+                    .write_all(
+                        b"{\"ok\":true,\"type\":\"subscribed\"}\n\
+                          {\"type\":\"assistant\",\"content\":\"The answer\",\"timestamp\":42}\n\
+                          {\"type\":\"closed\"}\n",
+                    )
+                    .expect("write subscription events");
+            });
+
+            let mut events = Vec::new();
+            reserve_pi_subscription("test-subscription").expect("reserve subscription");
+            subscribe_request("test-subscription", &socket_path, |event| {
+                events.push(event);
+                Ok(())
+            })
+            .expect("subscribe to messages");
+
+            assert_eq!(
+                events,
+                vec![
+                    json!({ "type": "subscribed" }),
+                    json!({
+                        "type": "assistant",
+                        "content": "The answer",
+                        "timestamp": 42,
+                    }),
+                ]
+            );
+            server.join().expect("join server");
+            fs::remove_dir_all(socket_path.parent().expect("stream parent"))
+                .expect("remove stream runtime");
+        }
+
+        #[test]
+        fn unsubscribe_closes_an_active_subscription() {
+            let socket_path = test_runtime_dir().join("unsubscribe.sock");
+            fs::create_dir_all(socket_path.parent().expect("subscription parent"))
+                .expect("create subscription parent");
+            let listener = UnixListener::bind(&socket_path).expect("bind subscription socket");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().expect("clone stream"))
+                    .read_line(&mut request)
+                    .expect("read request");
+                stream
+                    .write_all(b"{\"ok\":true,\"type\":\"subscribed\"}\n")
+                    .expect("acknowledge subscription");
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).expect("wait for disconnect"), 0);
+            });
+
+            let client_path = socket_path.clone();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let client = thread::spawn(move || {
+                reserve_pi_subscription("cancel-subscription").expect("reserve subscription");
+                subscribe_request("cancel-subscription", &client_path, |event| {
+                    if event["type"] == "subscribed" {
+                        ready_tx.send(()).expect("signal subscription readiness");
+                    }
+                    Ok(())
+                })
+            });
+
+            ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("subscription became ready");
+            unsubscribe_pi_messages("cancel-subscription").expect("unsubscribe");
+            client
+                .join()
+                .expect("join subscription client")
+                .expect("subscription stopped cleanly");
+            server.join().expect("join server");
+            fs::remove_dir_all(socket_path.parent().expect("subscription parent"))
+                .expect("remove subscription runtime");
+        }
+
+        #[test]
+        fn rejects_an_oversized_subscription_event_while_reading() {
+            let socket_path = test_runtime_dir().join("oversized-stream.sock");
+            fs::create_dir_all(socket_path.parent().expect("stream parent"))
+                .expect("create stream parent");
+            let listener = UnixListener::bind(&socket_path).expect("bind stream socket");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().expect("clone stream"))
+                    .read_line(&mut request)
+                    .expect("read request");
+                stream
+                    .write_all(b"{\"ok\":true,\"type\":\"subscribed\"}\n")
+                    .expect("acknowledge subscription");
+                let oversized = vec![b'x'; MAX_STREAM_EVENT_BYTES + 1];
+                let _ = stream.write_all(&oversized);
+            });
+
+            reserve_pi_subscription("oversized-subscription").expect("reserve subscription");
+            let error = subscribe_request("oversized-subscription", &socket_path, |_| Ok(()))
+                .expect_err("reject oversized event");
+
+            assert_eq!(error, "Pi response event is too large");
+            server.join().expect("join server");
+            fs::remove_dir_all(socket_path.parent().expect("stream parent"))
+                .expect("remove stream runtime");
+        }
+
+        #[test]
+        fn unsubscribe_before_the_worker_starts_cancels_the_subscription() {
+            reserve_pi_subscription("cancel-before-worker").expect("reserve subscription");
+            unsubscribe_pi_messages("cancel-before-worker").expect("cancel subscription");
+
+            subscribe_request(
+                "cancel-before-worker",
+                Path::new("/unreachable/pi.sock"),
+                |_| Ok(()),
+            )
+            .expect("skip cancelled subscription");
+        }
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
     use super::PiSession;
+    use serde_json::Value;
 
     pub fn list_pi_sessions() -> Result<Vec<PiSession>, String> {
         Err("The Pi bridge is supported only on Linux and macOS".to_string())
     }
 
     pub fn send_pi_prompt(_socket_path: &str, _message: &str) -> Result<(), String> {
+        Err("The Pi bridge is supported only on Linux and macOS".to_string())
+    }
+
+    pub fn subscribe_pi_messages<F>(
+        _subscription_id: &str,
+        _socket_path: &str,
+        _on_event: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(Value) -> Result<(), String>,
+    {
+        Err("The Pi bridge is supported only on Linux and macOS".to_string())
+    }
+
+    pub fn reserve_pi_subscription(_subscription_id: &str) -> Result<(), String> {
+        Err("The Pi bridge is supported only on Linux and macOS".to_string())
+    }
+
+    pub fn unsubscribe_pi_messages(_subscription_id: &str) -> Result<(), String> {
         Err("The Pi bridge is supported only on Linux and macOS".to_string())
     }
 }

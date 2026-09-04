@@ -1,5 +1,7 @@
 .DEFAULT_GOAL := help
 
+PNPM ?= $(if $(shell command -v pnpm 2>/dev/null),pnpm,corepack pnpm)
+
 .PHONY: *
 
 help: ## Display this help message
@@ -8,24 +10,24 @@ help: ## Display this help message
 ##@ Development
 
 install: ## Install all dependencies
-	pnpm install --frozen-lockfile
-	cd app && pnpm setup-vendors
+	$(PNPM) install --frozen-lockfile
+	cd app && $(PNPM) setup-vendors
 
 dev: ## Start development server
-	cd app && pnpm tauri dev
+	cd app && $(PNPM) tauri dev
 
 build: ## Build production app
-	cd app && pnpm tauri build
+	cd app && $(PNPM) tauri build
 
 build/%: ## Build for specific target (e.g., build/x86_64-apple-darwin)
-	cd app && pnpm tauri build --target $*
+	cd app && $(PNPM) tauri build --target $*
 
 clean: ## Remove all build artifacts
 	rm -rf app/.next app/out node_modules app/node_modules packages/foliate-js/node_modules
 	cd app/src-tauri && cargo clean
 
 fmt: ## Format all code
-	cd app && pnpm lint --fix || true
+	cd app && $(PNPM) lint --fix || true
 	cd app/src-tauri && cargo fmt
 
 ##@ Testing/Linting
@@ -35,7 +37,7 @@ can-release: lint ## Run all CI checks (lint)
 lint: lint/frontend lint/backend ## Run all linting
 
 lint/frontend: ## Lint TypeScript/React code
-	cd app && pnpm lint
+	cd app && $(PNPM) lint
 
 lint/backend: ## Lint Rust code
 	cd app/src-tauri && cargo fmt --check

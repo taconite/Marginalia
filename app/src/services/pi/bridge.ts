@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 
 export interface PiSession {
   socketPath: string;
@@ -15,6 +15,10 @@ export interface ReadingContext {
   selectedText: string;
   surroundingText: string;
 }
+
+export type PiSubscriptionEvent =
+  | { type: 'subscribed' }
+  | { type: 'assistant'; content: string; timestamp: number };
 
 const MAX_SELECTED_TEXT_CHARS = 12_000;
 const MAX_SURROUNDING_TEXT_CHARS = 16_000;
@@ -58,4 +62,18 @@ export function listPiSessions(): Promise<PiSession[]> {
 
 export function sendPiPrompt(socketPath: string, message: string): Promise<void> {
   return invoke<void>('send_pi_prompt', { socketPath, message });
+}
+
+export function subscribePiMessages(
+  subscriptionId: string,
+  socketPath: string,
+  onEvent: (event: PiSubscriptionEvent) => void,
+): Promise<void> {
+  const channel = new Channel<PiSubscriptionEvent>();
+  channel.onmessage = onEvent;
+  return invoke<void>('subscribe_pi_messages', { subscriptionId, socketPath, onEvent: channel });
+}
+
+export function unsubscribePiMessages(subscriptionId: string): Promise<void> {
+  return invoke<void>('unsubscribe_pi_messages', { subscriptionId });
 }

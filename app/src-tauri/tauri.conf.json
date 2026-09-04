@@ -7,8 +7,8 @@
   "build": {
     "frontendDist": "../out",
     "devUrl": "http://localhost:3000",
-    "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build"
+    "beforeDevCommand": "\"$npm_execpath\" run dev",
+    "beforeBuildCommand": "\"$npm_execpath\" run build"
   },
   "app": {
     "windows": [],

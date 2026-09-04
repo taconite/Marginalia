@@ -29,7 +29,8 @@ Pi integration:
 - Explicitly select a live Pi session by working directory and PID
 - Send the document title, author, section, page, selected text, surrounding
   text, and question
-- Continue the conversation in the existing Pi terminal in Neovim
+- Mirror Pi's assistant replies in the reading panel
+- Continue the same conversation in the existing Pi terminal in Neovim
 - Keep provider credentials and agent configuration out of Marginalia
 
 ## Requirements
@@ -64,8 +65,9 @@ The Pi adapter is deliberately separated by process and protocol:
 
 - Marginalia owns document rendering and context extraction.
 - Its Tauri backend discovers and connects to pi.nvim's private Unix sockets.
-- pi.nvim receives its existing newline-delimited `prompt` request and requires
-  no source changes.
+- Prompt delivery uses pi.nvim's existing short-lived `prompt` request.
+- A separate subscription mirrors every completed assistant message from the
+  selected live Pi session, including replies to prompts entered in Neovim.
 
 ## Built with
 

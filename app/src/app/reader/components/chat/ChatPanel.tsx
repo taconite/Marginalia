@@ -5,23 +5,72 @@ import React, {
   useEffect,
   useRef,
   useState,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
 import { FiRefreshCw, FiSend, FiX } from 'react-icons/fi';
 import { BsPin, BsPinFill } from 'react-icons/bs';
 import clsx from 'clsx';
+import DOMPurify from 'dompurify';
+import { marked } from 'marked';
 
 import { useChatStore } from '@/store/chatStore';
 import {
   buildPiPrompt,
   listPiSessions,
   sendPiPrompt,
+  subscribePiMessages,
   type PiSession,
+  unsubscribePiMessages,
 } from '@/services/pi/bridge';
+
+interface ChatMessage {
+  id: number;
+  html: string;
+}
 
 function errorMessage(cause: unknown, fallback: string): string {
   if (cause instanceof Error) return cause.message;
   return typeof cause === 'string' ? cause : fallback;
+}
+
+function openAssistantLink(event: ReactMouseEvent<HTMLDivElement>): void {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const link = target.closest('a[href]');
+  if (!(link instanceof HTMLAnchorElement)) return;
+
+  event.preventDefault();
+  if (link.protocol === 'http:' || link.protocol === 'https:') {
+    globalThis.open(link.href, '_blank', 'noopener,noreferrer');
+  }
+}
+
+function renderAssistantHtml(content: string): string {
+  return DOMPurify.sanitize(marked.parse(content) as string, {
+    USE_PROFILES: { html: true },
+    FORBID_TAGS: [
+      'audio',
+      'embed',
+      'iframe',
+      'img',
+      'object',
+      'source',
+      'style',
+      'track',
+      'video',
+    ],
+    FORBID_ATTR: [
+      'action',
+      'background',
+      'data',
+      'formaction',
+      'poster',
+      'src',
+      'srcset',
+      'style',
+    ],
+  });
 }
 
 const ChatPanel: React.FC = () => {
@@ -44,9 +93,14 @@ const ChatPanel: React.FC = () => {
 
   const isResizing = useRef(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const nextMessageId = useRef(0);
   const [sessions, setSessions] = useState<PiSession[]>([]);
   const [input, setInput] = useState('');
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [subscriptionRevision, setSubscriptionRevision] = useState(0);
   const [isLoadingSessions, setIsLoadingSessions] = useState(false);
+  const [subscribedSocketPath, setSubscribedSocketPath] = useState<string | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -70,6 +124,10 @@ const ChatPanel: React.FC = () => {
     setTimeout(() => inputRef.current?.focus(), 100);
   }, [isOpen, refreshSessions]);
 
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ block: 'end' });
+  }, [isOpen, messages]);
+
   const handleResizeStart = (event: ReactPointerEvent) => {
     event.preventDefault();
     isResizing.current = true;
@@ -91,11 +149,64 @@ const ChatPanel: React.FC = () => {
   };
 
   const selectedSession = sessions.find((session) => session.socketPath === selectedSocketPath);
+  const selectedSessionSocketPath = selectedSession?.socketPath;
+  const isSubscribed = subscribedSocketPath === selectedSessionSocketPath;
+
+  useEffect(() => {
+    setSubscribedSocketPath(null);
+    if (!selectedSessionSocketPath) return;
+
+    const subscriptionId = crypto.randomUUID();
+    let active = true;
+    const unsubscribe = () => {
+      void unsubscribePiMessages(subscriptionId).catch(() => undefined);
+    };
+    const isCurrent = () =>
+      active && useChatStore.getState().selectedSocketPath === selectedSessionSocketPath;
+
+    void subscribePiMessages(subscriptionId, selectedSessionSocketPath, (event) => {
+      if (event.type === 'subscribed' && !isCurrent()) {
+        unsubscribe();
+        return;
+      }
+      if (!isCurrent()) return;
+      if (event.type === 'subscribed') {
+        setSubscribedSocketPath(selectedSessionSocketPath);
+        setError(null);
+        return;
+      }
+      if (!event.content.trim()) return;
+      const html = renderAssistantHtml(event.content);
+      setMessages((current) => [
+        ...current,
+        {
+          id: ++nextMessageId.current,
+          html,
+        },
+      ]);
+    })
+      .then(() => {
+        if (!isCurrent()) return;
+        setSubscribedSocketPath(null);
+        setError('Pi session disconnected');
+      })
+      .catch((cause) => {
+        if (!isCurrent()) return;
+        setSubscribedSocketPath(null);
+        setError(errorMessage(cause, 'Unable to mirror Pi messages'));
+      });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [selectedSessionSocketPath, subscriptionRevision]);
 
   const handleSend = async () => {
-    if ((!input.trim() && !pendingContext) || !selectedSession || isSending) return;
+    if ((!input.trim() && !pendingContext) || !selectedSession || !isSubscribed || isSending) return;
 
-    const message = buildPiPrompt(input, {
+    const question = input.trim() || 'What does this passage mean?';
+    const message = buildPiPrompt(question, {
       bookTitle: pendingContext?.bookTitle || bookTitle,
       bookAuthor: pendingContext?.bookAuthor || bookAuthor,
       chapterTitle: pendingContext?.chapterTitle || currentChapter,
@@ -109,10 +220,11 @@ const ChatPanel: React.FC = () => {
     setNotice(null);
     try {
       await sendPiPrompt(selectedSession.socketPath, message);
+      if (useChatStore.getState().selectedSocketPath !== selectedSession.socketPath) return;
       setInput('');
       setPendingContext(null);
       if (inputRef.current) inputRef.current.style.height = 'auto';
-      setNotice(`Sent to Pi in ${selectedSession.cwd}`);
+      setNotice(`Queued in Pi for ${selectedSession.cwd}`);
     } catch (cause) {
       setError(errorMessage(cause, 'Unable to send prompt to Pi'));
     } finally {
@@ -149,7 +261,10 @@ const ChatPanel: React.FC = () => {
         <div className='flex-1' />
         <button
           className='btn btn-ghost btn-xs btn-square'
-          onClick={() => void refreshSessions()}
+          onClick={() => {
+            setSubscriptionRevision((revision) => revision + 1);
+            void refreshSessions();
+          }}
           disabled={isLoadingSessions}
           title='Refresh Pi sessions'
         >
@@ -181,6 +296,7 @@ const ChatPanel: React.FC = () => {
           value={selectedSocketPath}
           onChange={(event) => {
             setSelectedSocketPath(event.target.value);
+            setMessages([]);
             setNotice(null);
             setError(null);
           }}
@@ -204,7 +320,7 @@ const ChatPanel: React.FC = () => {
         )}
         {selectedSession && (
           <p className='text-xs text-base-content/50 truncate' title={selectedSession.socketPath}>
-            Answers appear in the Pi terminal for {selectedSession.cwd}.
+            {isSubscribed ? 'Mirroring' : 'Connecting to'} Pi in {selectedSession.cwd}.
           </p>
         )}
       </div>
@@ -216,6 +332,20 @@ const ChatPanel: React.FC = () => {
             {currentPage !== null ? ` · page ${currentPage}` : ''}
           </div>
         )}
+        {messages.map((message) => (
+          // Nested anchors retain native keyboard activation; this only redirects navigation.
+          // eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions
+          <div
+            key={message.id}
+            onClick={openAssistantLink}
+            className='mr-6 rounded-lg bg-base-200 px-3 py-2 text-sm text-base-content'
+          >
+            <div
+              className='prose prose-sm max-w-none break-words text-current'
+              dangerouslySetInnerHTML={{ __html: message.html }}
+            />
+          </div>
+        ))}
         {pendingContext ? (
           <div className='rounded-lg bg-base-200 px-3 py-2'>
             <div className='flex items-start gap-2'>
@@ -231,13 +361,14 @@ const ChatPanel: React.FC = () => {
               </button>
             </div>
           </div>
-        ) : (
+        ) : messages.length === 0 ? (
           <div className='flex items-center justify-center h-full text-center text-base-content/30 text-sm'>
             Select text in the document or ask Pi a question about your current location.
           </div>
-        )}
+        ) : null}
         {notice && <div className='alert alert-success text-xs'>{notice}</div>}
         {error && <div className='alert alert-error text-xs'>{error}</div>}
+        <div ref={messagesEndRef} />
       </div>
 
       <div className='border-t border-base-300 px-3 py-2'>
@@ -259,8 +390,16 @@ const ChatPanel: React.FC = () => {
           <button
             className='btn btn-xs btn-circle btn-primary'
             onClick={() => void handleSend()}
-            disabled={(!input.trim() && !pendingContext) || !selectedSession || isSending}
-            title={selectedSession ? 'Send to Pi' : 'Select a Pi session first'}
+            disabled={
+              (!input.trim() && !pendingContext) || !selectedSession || !isSubscribed || isSending
+            }
+            title={
+              !selectedSession
+                ? 'Select a Pi session first'
+                : isSubscribed
+                  ? 'Send to Pi'
+                  : 'Connecting to Pi'
+            }
           >
             {isSending ? <span className='loading loading-spinner loading-xs' /> : <FiSend size={12} />}
           </button>

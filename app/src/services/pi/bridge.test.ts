@@ -1,14 +1,31 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const invokeMock = vi.hoisted(() => vi.fn());
+const channels = vi.hoisted(() => [] as Array<{ onmessage?: (message: unknown) => void }>);
 
-vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: invokeMock,
+  Channel: class {
+    onmessage?: (message: unknown) => void;
 
-import { buildPiPrompt, listPiSessions, sendPiPrompt } from './bridge';
+    constructor() {
+      channels.push(this);
+    }
+  },
+}));
+
+import {
+  buildPiPrompt,
+  listPiSessions,
+  sendPiPrompt,
+  subscribePiMessages,
+  unsubscribePiMessages,
+} from './bridge';
 
 describe('Pi bridge', () => {
   beforeEach(() => {
     invokeMock.mockReset();
+    channels.length = 0;
   });
 
   it('formats document metadata, excerpts, and the question', () => {
@@ -69,6 +86,30 @@ Why is this important?
     expect(invokeMock).toHaveBeenNthCalledWith(2, 'send_pi_prompt', {
       socketPath: '/tmp/pi.sock',
       message: 'Question',
+    });
+  });
+
+  it('subscribes to assistant messages through a native channel', async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const onEvent = vi.fn();
+
+    await expect(
+      subscribePiMessages('subscription-1', '/tmp/pi.sock', onEvent),
+    ).resolves.toBeUndefined();
+
+    expect(invokeMock).toHaveBeenCalledWith('subscribe_pi_messages', {
+      subscriptionId: 'subscription-1',
+      socketPath: '/tmp/pi.sock',
+      onEvent: channels[0],
+    });
+
+    const event = { type: 'assistant' as const, content: 'Answer', timestamp: 42 };
+    channels[0]?.onmessage?.(event);
+    expect(onEvent).toHaveBeenCalledWith(event);
+
+    await expect(unsubscribePiMessages('subscription-1')).resolves.toBeUndefined();
+    expect(invokeMock).toHaveBeenLastCalledWith('unsubscribe_pi_messages', {
+      subscriptionId: 'subscription-1',
     });
   });
 });

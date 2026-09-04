@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use tauri::utils::config::BackgroundThrottlingPolicy;
-use tauri::{AppHandle, Manager};
+use tauri::{ipc::Channel, AppHandle, Listener, Manager, WebviewWindow};
 use tauri_plugin_fs::FsExt;
 
 #[cfg(desktop)]
-use tauri::{Listener, Url};
+use tauri::Url;
 
 mod dir_scanner;
 mod pi_bridge;
@@ -110,6 +110,36 @@ async fn send_pi_prompt(socket_path: String, message: String) -> Result<(), Stri
         .map_err(|error| format!("Failed to contact Pi: {error}"))?
 }
 
+#[tauri::command]
+async fn subscribe_pi_messages(
+    window: WebviewWindow,
+    subscription_id: String,
+    socket_path: String,
+    on_event: Channel<serde_json::Value>,
+) -> Result<(), String> {
+    pi_bridge::reserve_pi_subscription(&subscription_id)?;
+    let destroyed_subscription_id = subscription_id.clone();
+    let destroyed_listener = window.once("tauri://destroyed", move |_| {
+        let _ = pi_bridge::unsubscribe_pi_messages(&destroyed_subscription_id);
+    });
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        pi_bridge::subscribe_pi_messages(&subscription_id, &socket_path, |event| {
+            on_event
+                .send(event)
+                .map_err(|error| format!("Cannot deliver Pi response: {error}"))
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to contact Pi: {error}"))?;
+    window.unlisten(destroyed_listener);
+    result
+}
+
+#[tauri::command]
+fn unsubscribe_pi_messages(subscription_id: String) -> Result<(), String> {
+    pi_bridge::unsubscribe_pi_messages(&subscription_id)
+}
+
 #[derive(Clone, serde::Serialize)]
 #[allow(dead_code)]
 struct SingleInstancePayload {
@@ -132,6 +162,8 @@ pub fn run() {
             dir_scanner::read_dir,
             list_pi_sessions,
             send_pi_prompt,
+            subscribe_pi_messages,
+            unsubscribe_pi_messages,
         ])
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_persisted_scope::init())
