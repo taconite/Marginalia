@@ -49,6 +49,42 @@ Open the **Ask Pi** panel in Marginalia, refresh the session list, and select th
 intended session. Marginalia never falls back to a different session if that
 selection disconnects.
 
+### Local PDF verification
+
+PDF questions include the readable local file path, including without a selection.
+Resolution failures leave the draft and selected text intact; no prompt is sent.
+For an isolated session, create and enter `/tmp/marginalia-local-verification`, then run:
+```bash
+pi --no-extensions --extension ~/Tools/pi-nvim/extension.ts --session /tmp/marginalia-local-verification/session.jsonl --name marginalia-local-verification --tools read,bash
+```
+Select that working directory and PID in the reader. Test a selection, a question
+requiring another page, page rendering plus an image-read tool call, and a follow-up.
+Check the transcript's path against the open PDF and confirm replies in the reader.
+Run adapter checks with `cd app && corepack pnpm exec vitest run src/services/pi/bridge.test.ts`.
+Run frontend validation with `make lint/frontend`. Unit tests do not replace reader tests.
+
+## SSH from a Mac reader to Ubuntu Pi
+
+Configure an SSH host alias on the Mac; first confirm `ssh your-alias true` works
+without a password or host-key prompt. Marginalia uses system `ssh` in batch mode.
+Ubuntu needs OpenSSH with Unix-socket forwarding and a running Pi session with the existing pi.nvim bridge.
+Pi messages travel through native SSH forwarding; no Python helper is installed or executed.
+In **Ask Pi**, choose **SSH**, enter the alias, then leave the field to connect.
+Select the remote session by working directory and PID. Local mode uses the original bridge.
+
+For each PDF question, Marginalia hashes the local file and checks the Ubuntu cache
+at `~/.cache/marginalia/pdfs/<sha256>.pdf`. It streams missing files over SSH using standard Ubuntu file commands and verifies
+their hash before publishing them. Cached PDFs are not retransferred; Pi receives
+the Ubuntu path. Closing the reader stops its SSH connections and leaves Pi running.
+**Cancel** stops document preparation and retains the draft. Failed sends are never
+automatically retried; check Pi before retrying because delivery may have occurred.
+
+Validate with `cd app/src-tauri && cargo test pi_bridge --lib`; also run the frontend checks above.
+On the actual Mac reader, repeat selection, cross-page lookup, Figure 2 image access,
+and follow-up tests. Verify the cached SHA-256, no second upload, interrupted uploads,
+SSH disconnection, and reader-close cleanup. Repeat local Ubuntu tests for regressions.
+Unit and loopback tests do not establish actual MacBook acceptance.
+
 ## Development
 
 Requires Rust, Node.js 20+, and pnpm.

@@ -140,6 +140,29 @@ fn unsubscribe_pi_messages(subscription_id: String) -> Result<(), String> {
     pi_bridge::unsubscribe_pi_messages(&subscription_id)
 }
 
+#[tauri::command]
+async fn pi_ssh(
+    window: WebviewWindow,
+    operation_id: String,
+    ssh_host: String,
+    request: serde_json::Value,
+    on_event: Channel<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let job = pi_bridge::ssh::reserve(&operation_id)?;
+    let listener = window.once("tauri://destroyed", move |_| {
+        pi_bridge::ssh::cancel(&operation_id);
+    });
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        job.run(&ssh_host, request, |event| {
+            on_event.send(event).map_err(|e| e.to_string())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string());
+    window.unlisten(listener);
+    result?
+}
+
 #[derive(Clone, serde::Serialize)]
 #[allow(dead_code)]
 struct SingleInstancePayload {
@@ -164,6 +187,7 @@ pub fn run() {
             send_pi_prompt,
             subscribe_pi_messages,
             unsubscribe_pi_messages,
+            pi_ssh,
         ])
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_persisted_scope::init())

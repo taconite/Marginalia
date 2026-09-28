@@ -8,9 +8,9 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import Button from '@/components/Button';
 
-const ChatToggler: React.FC = () => {
+const ChatToggler: React.FC<{ bookKey: string }> = ({ bookKey }) => {
   const _ = useTranslation();
-  const { isOpen, togglePanel } = useChatStore();
+  const { isOpen, bookKey: chatBookKey, togglePanel } = useChatStore();
   const iconSize16 = useResponsiveSize(16);
 
   return (
@@ -18,10 +18,10 @@ const ChatToggler: React.FC = () => {
       icon={
         <LuMessageSquareText
           size={iconSize16}
-          className={isOpen ? 'text-primary' : 'text-base-content'}
+          className={isOpen && chatBookKey === bookKey ? 'text-primary' : 'text-base-content'}
         />
       }
-      onClick={togglePanel}
+      onClick={() => togglePanel(bookKey)}
       label={_('Ask Pi')}
     />
   );

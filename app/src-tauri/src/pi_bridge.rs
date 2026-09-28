@@ -33,6 +33,7 @@ pub fn reserve_pi_subscription(subscription_id: &str) -> Result<(), String> {
 }
 
 pub fn unsubscribe_pi_messages(subscription_id: &str) -> Result<(), String> {
+    ssh::cancel(subscription_id);
     platform::unsubscribe_pi_messages(subscription_id)
 }
 
@@ -154,7 +155,7 @@ mod platform {
         SUBSCRIPTIONS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    fn subscribe_request<F>(
+    pub(super) fn subscribe_request<F>(
         subscription_id: &str,
         socket_path: &Path,
         mut on_event: F,
@@ -360,7 +361,7 @@ mod platform {
         validate_socket(socket_path)
     }
 
-    fn send_request(socket_path: &Path, request: &Value) -> Result<(), String> {
+    pub(super) fn send_request(socket_path: &Path, request: &Value) -> Result<(), String> {
         let mut stream = UnixStream::connect(socket_path)
             .map_err(|error| format!("Cannot connect to Pi: {error}"))?;
         stream
@@ -457,8 +458,8 @@ mod platform {
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock before Unix epoch")
                 .as_nanos();
-            std::env::temp_dir().join(format!(
-                "marginalia-pi-bridge-{}-{timestamp}-{}",
+            PathBuf::from("/tmp").join(format!(
+                "marginalia-pi-{}-{timestamp}-{}",
                 std::process::id(),
                 NEXT_ID.fetch_add(1, Ordering::Relaxed)
             ))
@@ -545,7 +546,7 @@ mod platform {
                 let value: Value = serde_json::from_str(&request).expect("decode request");
                 assert_eq!(
                     value,
-                    json!({ "type": "prompt", "message": "Explain this" })
+                    json!({ "type": "prompt", "message": "中".repeat(28_000) })
                 );
                 stream
                     .write_all(b"{\"ok\":true}\n")
@@ -557,7 +558,7 @@ mod platform {
             validate_session_socket(&info_dir, &socket_path).expect("validate session");
             send_request(
                 &socket_path,
-                &json!({ "type": "prompt", "message": "Explain this" }),
+                &json!({ "type": "prompt", "message": "中".repeat(28_000) }),
             )
             .expect("send prompt");
 
@@ -730,5 +731,360 @@ mod platform {
 
     pub fn unsubscribe_pi_messages(_subscription_id: &str) -> Result<(), String> {
         Err("The Pi bridge is supported only on Linux and macOS".to_string())
+    }
+}
+
+pub mod ssh {
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+    #[cfg(unix)]
+    use std::os::unix::{fs::DirBuilderExt, process::CommandExt};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    #[derive(Default)]
+    struct State {
+        cancelled: bool,
+        child: Option<Child>,
+    }
+    type Jobs = Mutex<HashMap<String, Arc<Mutex<State>>>>;
+    static JOBS: OnceLock<Jobs> = OnceLock::new();
+    pub struct Job(String, Arc<Mutex<State>>);
+    fn jobs() -> &'static Jobs {
+        JOBS.get_or_init(Default::default)
+    }
+    pub fn reserve(id: &str) -> Result<Job, String> {
+        let mut jobs = jobs().lock().map_err(|e| e.to_string())?;
+        if id.is_empty() || jobs.contains_key(id) {
+            return Err("Invalid or duplicate SSH operation ID".into());
+        }
+        let state = Arc::new(Mutex::new(State::default()));
+        jobs.insert(id.into(), state.clone());
+        Ok(Job(id.into(), state))
+    }
+    pub fn cancel(id: &str) {
+        if let Some(state) = jobs().lock().unwrap().get(id) {
+            let mut state = state.lock().unwrap();
+            state.cancelled = true;
+            if let Some(child) = state.child.as_mut() {
+                stop(child);
+            }
+        }
+    }
+    fn stop(child: &mut Child) {
+        #[cfg(unix)]
+        // SAFETY: the child owns this process group; no pointers are used.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+    }
+    impl Drop for Job {
+        fn drop(&mut self) {
+            cancel(&self.0);
+            jobs().lock().unwrap().remove(&self.0);
+            if let Some(mut child) = self.1.lock().unwrap().child.take() {
+                let _ = child.wait();
+            }
+        }
+    }
+    fn command(host: &str, forwarding: Option<&str>, script: &str) -> Result<Command, String> {
+        if !host.starts_with(|c: char| c.is_ascii_alphanumeric())
+            || !host
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+        {
+            return Err("Invalid SSH host alias".into());
+        }
+        let mut command = Command::new("ssh");
+        #[cfg(unix)]
+        command.process_group(0);
+        command.args([
+            "-T",
+            "-oBatchMode=yes",
+            "-oConnectTimeout=10",
+            "-oServerAliveInterval=15",
+            "-oServerAliveCountMax=2",
+            "-oControlPath=none",
+            "-oControlMaster=no",
+            "-oExitOnForwardFailure=yes",
+        ]);
+        if let Some(forwarding) = forwarding {
+            command.args(["-L", forwarding]);
+        }
+        // Quote backslashes outside single quotes for both fish and POSIX shells.
+        let script: String = script
+            .chars()
+            .map(|c| match c {
+                '\'' => "'\\''".into(),
+                '\\' => "'\\\\'".into(),
+                _ => c.to_string(),
+            })
+            .collect();
+        command.args(["--", host, &format!("sh -c '{script}'")]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(command)
+    }
+    impl Job {
+        fn directory(&self) -> std::path::PathBuf {
+            let hash = format!("{:x}", Sha256::digest(self.0.as_bytes()));
+            format!("/tmp/marginalia-{}-{}", std::process::id(), &hash[..16]).into()
+        }
+        fn execute<T>(
+            &self,
+            mut command: Command,
+            tunnel: bool,
+            work: impl FnOnce(ChildStdin, BufReader<ChildStdout>) -> Result<T, String>,
+        ) -> Result<T, String> {
+            let (input, output, error) = {
+                let mut state = self.1.lock().unwrap();
+                if state.cancelled {
+                    return Err("SSH operation cancelled".into());
+                }
+                let mut child = command
+                    .spawn()
+                    .map_err(|e| format!("Cannot start SSH: {e}"))?;
+                let pipes = (
+                    child.stdin.take().unwrap(),
+                    child.stdout.take().unwrap(),
+                    child.stderr.take().unwrap(),
+                );
+                state.child = Some(child);
+                pipes
+            };
+            let errors = std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = error.take(8192).read_to_string(&mut text);
+                text
+            });
+            let result = work(input, BufReader::new(output));
+            if tunnel || result.is_err() {
+                if let Some(child) = self.1.lock().unwrap().child.as_mut() {
+                    stop(child);
+                }
+            }
+            let status = self
+                .1
+                .lock()
+                .unwrap()
+                .child
+                .as_mut()
+                .unwrap()
+                .wait()
+                .map_err(|e| e.to_string())?;
+            let stderr = errors.join().unwrap_or_default();
+            if !tunnel && !status.success() {
+                return Err(format!("SSH failed: {}", stderr.trim()));
+            }
+            result.map_err(|error| format!("{error}. {}", stderr.trim()))
+        }
+        fn capture(
+            &self,
+            host: &str,
+            script: &str,
+            source: &mut impl Read,
+        ) -> Result<String, String> {
+            self.execute(command(host, None, script)?, false, |mut input, output| {
+                std::io::copy(source, &mut input).map_err(|e| e.to_string())?;
+                drop(input);
+                let mut text = String::new();
+                output
+                    .take(4 * 1024 * 1024 + 1)
+                    .read_to_string(&mut text)
+                    .map_err(|e| e.to_string())?;
+                if text.len() > 4 * 1024 * 1024 {
+                    return Err("SSH output too large".into());
+                }
+                Ok(text)
+            })
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        fn relay(
+            &self,
+            host: &str,
+            socket: &str,
+            request: &Value,
+            on_event: impl FnMut(Value) -> Result<(), String>,
+        ) -> Result<(), String> {
+            if !socket.starts_with('/') || socket.contains([':', '\n', '\r']) {
+                return Err("Invalid remote socket path".into());
+            }
+            let path = self.directory().join("pi.sock");
+            let forwarding = format!("{}:{socket}", path.display());
+            let command = command(host, Some(&forwarding), "printf 'ready\\n'; cat >/dev/null")?;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(self.directory())
+                .map_err(|e| e.to_string())?;
+            let result = self.execute(command, true, |_input, mut output| {
+                let mut ready = String::new();
+                output.read_line(&mut ready).map_err(|e| e.to_string())?;
+                if ready != "ready\n" {
+                    return Err("SSH tunnel failed to open".into());
+                }
+                if request["type"] == "subscribe" {
+                    super::platform::reserve_pi_subscription(&self.0)?;
+                    super::platform::subscribe_request(&self.0, &path, on_event)
+                } else {
+                    super::platform::send_request(&path, request)
+                }
+            });
+            let _ = std::fs::remove_dir_all(self.directory());
+            result
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        fn relay(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Value,
+            _: impl FnMut(Value) -> Result<(), String>,
+        ) -> Result<(), String> {
+            Err("SSH socket forwarding requires Linux or macOS".into())
+        }
+        pub fn run(
+            self,
+            host: &str,
+            request: Value,
+            on_event: impl FnMut(Value) -> Result<(), String>,
+        ) -> Result<Value, String> {
+            match request["op"].as_str() {
+                Some("relay") => {
+                    self.relay(
+                        host,
+                        request["socketPath"].as_str().ok_or("Missing Pi socket")?,
+                        &request["request"],
+                        on_event,
+                    )?;
+                    Ok(json!({"ok":true}))
+                }
+                Some("discover") => {
+                    let metadata = self.capture(
+                        host,
+                        r#"set -eu
+root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pi-nvim"
+[ -d "$root" ] || root="${TMPDIR:-/tmp}/pi-nvim-$(id -u)"
+[ -d "$root" ] || exit 0
+[ "$(stat -c '%u:%a' "$root")" = "$(id -u):700" ]
+for file in "$root"/sockets/*.sock.info; do
+  [ -f "$file" ] && [ ! -L "$file" ] && [ -O "$file" ] && [ -S "${file%.info}" ] || continue
+  [ "$(stat -c %s "$file")" -le 65536 ] || continue
+  printf '\000'
+  cat -- "$file" || continue
+done"#,
+                        &mut std::io::empty(),
+                    )?;
+                    let mut sessions = Vec::new();
+                    for info in metadata
+                        .split('\0')
+                        .filter_map(|entry| serde_json::from_str::<Value>(entry).ok())
+                    {
+                        let Some(socket) = info["socket_path"].as_str() else {
+                            continue;
+                        };
+                        if self
+                            .relay(host, socket, &json!({"type":"ping"}), |_| Ok(()))
+                            .is_ok()
+                        {
+                            sessions.push(json!({"socketPath":socket,"cwd":info["cwd"],"pid":info["pid"],"createdAt":info["created_at"]}));
+                        }
+                    }
+                    sessions.sort_by_key(|info| std::cmp::Reverse(info["createdAt"].as_u64()));
+                    Ok(json!(sessions))
+                }
+                Some("receive") => {
+                    let mut file =
+                        std::fs::File::open(request["path"].as_str().ok_or("Missing PDF path")?)
+                            .map_err(|e| e.to_string())?;
+                    let mut hash = Sha256::new();
+                    let mut buffer = [0; 65536];
+                    loop {
+                        if self.1.lock().unwrap().cancelled {
+                            return Err("PDF preparation cancelled".into());
+                        }
+                        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+                        if count == 0 {
+                            break;
+                        }
+                        hash.update(&buffer[..count]);
+                    }
+                    let digest = format!("{:x}", hash.finalize());
+                    let setup = format!("set -eu; dir=\"$HOME/.cache/marginalia/pdfs\"; target=\"$dir/{digest}.pdf\";");
+                    let verify = format!(
+                        "[ \"$(sha256sum < \"$target\" | cut -d ' ' -f 1)\" = '{digest}' ]"
+                    );
+                    let cached = self.capture(host, &format!("{setup} if [ -f \"$target\" ] && {verify}; then printf '%s' \"$target\"; fi"), &mut std::io::empty())?;
+                    if !cached.is_empty() {
+                        return Ok(json!({"path":cached}));
+                    }
+                    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+                    let script = format!(
+                        r#"{setup}
+mkdir -p -m 700 -- "$dir"
+temporary=$(mktemp "$dir/.upload-XXXXXXXX")
+trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+cat > "$temporary"
+[ "$(sha256sum < "$temporary" | cut -d ' ' -f 1)" = '{digest}' ]
+mv -f -- "$temporary" "$target"
+printf '%s' "$target""#
+                    );
+                    let path = self.capture(host, &script, &mut file)?;
+                    if path.is_empty() {
+                        return Err("Missing remote PDF path".into());
+                    }
+                    Ok(json!({"path":path}))
+                }
+                _ => Err("Unsupported SSH operation".into()),
+            }
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn rejects_host_options_and_shell_syntax() {
+            for host in ["", "-oProxyCommand=x", "host;x", "user@host", "host\n"] {
+                assert!(command(host, None, "true").is_err());
+            }
+            let command = command(
+                "ubuntu-work",
+                Some("/tmp/local.sock:/run/remote.sock"),
+                "true",
+            )
+            .unwrap();
+            let args: Vec<_> = command.get_args().collect();
+            assert!(args.iter().any(|arg| *arg == "-oBatchMode=yes"));
+            assert!(args
+                .windows(2)
+                .any(|args| args == ["-L", "/tmp/local.sock:/run/remote.sock"]));
+            assert!(args.iter().any(|arg| *arg == "ubuntu-work"));
+        }
+        #[test]
+        fn cancellation_before_start_prevents_spawn() {
+            let job = reserve("cancel-ssh-before-start").unwrap();
+            cancel("cancel-ssh-before-start");
+            assert!(job
+                .run("example", json!({"op":"discover"}), |_| Ok(()))
+                .unwrap_err()
+                .contains("cancelled"));
+        }
+        #[test]
+        fn cancellation_stops_and_reaps_a_child() {
+            let job = reserve("cancel-running-ssh").unwrap();
+            let child = Command::new("sleep").arg("60").spawn().unwrap();
+            job.1.lock().unwrap().child = Some(child);
+            cancel("cancel-running-ssh");
+            let mut state = job.1.lock().unwrap();
+            let status = state.child.as_mut().unwrap().wait().unwrap();
+            assert!(!status.success());
+            drop(state);
+            drop(job);
+            assert!(!jobs().lock().unwrap().contains_key("cancel-running-ssh"));
+        }
     }
 }

@@ -269,7 +269,7 @@ const HeaderBar: React.FC<HeaderBarProps> = ({
         <div className='header-tools-end bg-base-100 z-20 ms-auto flex h-full min-w-max items-center gap-x-4 ps-2 max-[350px]:gap-x-2'>
           {!isHeaderCompact && <SettingsToggler bookKey={bookKey} />}
           <NotebookToggler bookKey={bookKey} />
-          <ChatToggler />
+          <ChatToggler bookKey={bookKey} />
           <Dropdown
             label={_('View Options')}
             className='exclude-title-bar-mousedown dropdown-bottom dropdown-end'

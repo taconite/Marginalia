@@ -15,19 +15,24 @@ import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 
 import { useChatStore } from '@/store/chatStore';
+import { useEnv } from '@/context/EnvContext';
+import { useBookDataStore } from '@/store/bookDataStore';
+import { useReaderStore } from '@/store/readerStore';
 import {
   buildPiPrompt,
   listPiSessions,
+  resolveLocalPdfPath,
+  preparePiDocument,
   sendPiPrompt,
   subscribePiMessages,
   type PiSession,
   unsubscribePiMessages,
 } from '@/services/pi/bridge';
 
-interface ChatMessage {
-  id: number;
-  html: string;
-}
+type ChatMessage = { id: number } & (
+  | { role: 'user'; text: string; selectedText?: string }
+  | { role: 'assistant'; html: string }
+);
 
 function errorMessage(cause: unknown, fallback: string): string {
   if (cause instanceof Error) return cause.message;
@@ -74,24 +79,38 @@ function renderAssistantHtml(content: string): string {
 }
 
 const ChatPanel: React.FC = () => {
+  const { envConfig } = useEnv();
   const {
     isOpen,
     isPinned,
     panelWidth,
-    pendingContext,
-    bookTitle,
-    bookAuthor,
-    currentChapter,
-    currentPage,
+    pendingContext: storedContext,
+    bookKey: chatBookKey,
+    reconcileBooks,
     selectedSocketPath,
+    connection, setConnection,
     setOpen,
     setPinned,
     setPanelWidth,
     setPendingContext,
     setSelectedSocketPath,
   } = useChatStore();
+  const bookKeys = useReaderStore((state) => state.bookKeys);
+  const bookKey = chatBookKey && bookKeys.includes(chatBookKey) ? chatBookKey : null;
+  const pendingContext = storedContext?.bookKey === bookKey ? storedContext : null;
+  useEffect(() => reconcileBooks(bookKeys), [bookKeys, reconcileBooks]);
+  const progress = useReaderStore((state) => state.getProgress(bookKey ?? ''));
+  const currentChapter = pendingContext?.chapterTitle ?? progress?.sectionLabel ?? '';
+  const currentPage = pendingContext?.page ?? progress?.page ?? null;
 
   const isResizing = useRef(false);
+  const preparation = useRef<string | null>(null);
+  const cancelPreparation = useCallback(() => {
+    if (preparation.current) void unsubscribePiMessages(preparation.current).catch(() => undefined);
+    preparation.current = null;
+    setNotice(null);
+  }, []);
+  useEffect(() => cancelPreparation, [cancelPreparation]);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const nextMessageId = useRef(0);
@@ -101,28 +120,41 @@ const ChatPanel: React.FC = () => {
   const [subscriptionRevision, setSubscriptionRevision] = useState(0);
   const [isLoadingSessions, setIsLoadingSessions] = useState(false);
   const [subscribedSocketPath, setSubscribedSocketPath] = useState<string | null>(null);
+  const activeSubscription = useRef<string | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [waitingSince, setWaitingSince] = useState<number | null>(null);
+  const [waitingSeconds, setWaitingSeconds] = useState(0);
+
+  useEffect(() => {
+    if (waitingSince === null) return;
+    const timer = setInterval(() => {
+      setWaitingSeconds(Math.floor((Date.now() - waitingSince) / 1000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [waitingSince]);
 
   const refreshSessions = useCallback(async () => {
     setIsLoadingSessions(true);
     setError(null);
     try {
-      setSessions(await listPiSessions());
+      const discovered = await listPiSessions(connection);
+      if (useChatStore.getState().connection === connection) setSessions(discovered);
     } catch (cause) {
-      setSessions([]);
+      if (useChatStore.getState().connection !== connection) return;
       setError(errorMessage(cause, 'Unable to discover Pi sessions'));
     } finally {
-      setIsLoadingSessions(false);
+      if (useChatStore.getState().connection === connection) setIsLoadingSessions(false);
     }
-  }, []);
+  }, [connection]);
 
   useEffect(() => {
     if (!isOpen) return;
     void refreshSessions();
     setTimeout(() => inputRef.current?.focus(), 100);
   }, [isOpen, refreshSessions]);
+  useEffect(() => { setSessions([]); setMessages([]); setNotice(null); cancelPreparation(); }, [connection, cancelPreparation]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ block: 'end' });
@@ -153,7 +185,9 @@ const ChatPanel: React.FC = () => {
   const isSubscribed = subscribedSocketPath === selectedSessionSocketPath;
 
   useEffect(() => {
+    activeSubscription.current = null;
     setSubscribedSocketPath(null);
+    setWaitingSince(null);
     if (!selectedSessionSocketPath) return;
 
     const subscriptionId = crypto.randomUUID();
@@ -162,7 +196,7 @@ const ChatPanel: React.FC = () => {
       void unsubscribePiMessages(subscriptionId).catch(() => undefined);
     };
     const isCurrent = () =>
-      active && useChatStore.getState().selectedSocketPath === selectedSessionSocketPath;
+      active && useChatStore.getState().connection === connection && useChatStore.getState().selectedSocketPath === selectedSessionSocketPath;
 
     void subscribePiMessages(subscriptionId, selectedSessionSocketPath, (event) => {
       if (event.type === 'subscribed' && !isCurrent()) {
@@ -171,63 +205,100 @@ const ChatPanel: React.FC = () => {
       }
       if (!isCurrent()) return;
       if (event.type === 'subscribed') {
+        activeSubscription.current = subscriptionId;
         setSubscribedSocketPath(selectedSessionSocketPath);
         setError(null);
         return;
       }
       if (!event.content.trim()) return;
+      setWaitingSince(null);
       const html = renderAssistantHtml(event.content);
       setMessages((current) => [
         ...current,
         {
           id: ++nextMessageId.current,
+          role: 'assistant',
           html,
         },
       ]);
-    })
+    }, connection)
       .then(() => {
         if (!isCurrent()) return;
+        activeSubscription.current = null;
         setSubscribedSocketPath(null);
         setError('Pi session disconnected');
+        setWaitingSince(null);
       })
       .catch((cause) => {
         if (!isCurrent()) return;
+        activeSubscription.current = null;
         setSubscribedSocketPath(null);
         setError(errorMessage(cause, 'Unable to mirror Pi messages'));
+        setWaitingSince(null);
       });
 
     return () => {
       active = false;
+      activeSubscription.current = null;
       unsubscribe();
     };
-  }, [selectedSessionSocketPath, subscriptionRevision]);
+  }, [selectedSessionSocketPath, subscriptionRevision, connection]);
 
   const handleSend = async () => {
-    if ((!input.trim() && !pendingContext) || !selectedSession || !isSubscribed || isSending) return;
+    if (!bookKey || !useReaderStore.getState().bookKeys.includes(bookKey) || (!input.trim() && !pendingContext) || !selectedSession || !isSubscribed || isSending) return;
 
     const question = input.trim() || 'What does this passage mean?';
-    const message = buildPiPrompt(question, {
-      bookTitle: pendingContext?.bookTitle || bookTitle,
-      bookAuthor: pendingContext?.bookAuthor || bookAuthor,
-      chapterTitle: pendingContext?.chapterTitle || currentChapter,
-      page: pendingContext?.page ?? currentPage,
-      selectedText: pendingContext?.selectedText || '',
-      surroundingText: pendingContext?.surroundingText || '',
-    });
+    const subscriptionId = activeSubscription.current;
+    const operationId = crypto.randomUUID();
+    preparation.current = operationId;
+    let sending = false;
 
     setIsSending(true);
     setError(null);
     setNotice(null);
     try {
-      await sendPiPrompt(selectedSession.socketPath, message);
+      const book = bookKey && useBookDataStore.getState().getBookData(bookKey)?.book;
+      if (!book) throw new Error('Unable to identify the document to send to Pi');
+      const progress = useReaderStore.getState().getProgress(bookKey);
+      const localPath = await resolveLocalPdfPath(await envConfig.getAppService(), book);
+      if (preparation.current !== operationId || !useReaderStore.getState().bookKeys.includes(bookKey)) return;
+      if (connection.mode === 'ssh' && localPath) setNotice('Checking PDF cache and transferring if needed…');
+      const pdfPath = await preparePiDocument(localPath, connection, operationId);
+      if (preparation.current !== operationId || useChatStore.getState().connection !== connection || !useReaderStore.getState().bookKeys.includes(bookKey)) return;
       if (useChatStore.getState().selectedSocketPath !== selectedSession.socketPath) return;
+      if (!subscriptionId || activeSubscription.current !== subscriptionId) {
+        throw new Error('Pi subscription disconnected or changed. Reconnect and send again.');
+      }
+      const message = buildPiPrompt(question, {
+        pdfPath,
+        bookTitle: pendingContext?.bookTitle || book.title,
+        bookAuthor: pendingContext?.bookAuthor || book.author,
+        chapterTitle: pendingContext?.chapterTitle ?? progress?.sectionLabel ?? '',
+        page: pendingContext?.page ?? progress?.page ?? null,
+        selectedText: pendingContext?.selectedText || '',
+        surroundingText: pendingContext?.surroundingText || '',
+      });
+      setNotice(null);
+      preparation.current = null;
+      sending = true;
+      setWaitingSeconds(0);
+      setWaitingSince(Date.now());
+      const userMessage: ChatMessage = {
+        id: ++nextMessageId.current, role: 'user', text: question, selectedText: pendingContext?.selectedText,
+      };
+      await sendPiPrompt(selectedSession.socketPath, message, connection);
+      if (useChatStore.getState().connection !== connection || useChatStore.getState().selectedSocketPath !== selectedSession.socketPath) return;
+      setMessages((current) => [...current, userMessage].sort((a, b) => a.id - b.id));
       setInput('');
-      setPendingContext(null);
+      if (useChatStore.getState().pendingContext === pendingContext) setPendingContext(null);
       if (inputRef.current) inputRef.current.style.height = 'auto';
-      setNotice(`Queued in Pi for ${selectedSession.cwd}`);
     } catch (cause) {
-      setError(errorMessage(cause, 'Unable to send prompt to Pi'));
+      if (sending) setWaitingSince(null);
+      setNotice(null);
+      setError(errorMessage(cause, 'Unable to send prompt to Pi') + (sending ? ' Check Pi before retrying; delivery may have occurred.' : ''));
     } finally {
+      preparation.current = null;
+      setNotice(null);
       setIsSending(false);
     }
   };
@@ -262,7 +333,7 @@ const ChatPanel: React.FC = () => {
         <button
           className='btn btn-ghost btn-xs btn-square'
           onClick={() => {
-            setSubscriptionRevision((revision) => revision + 1);
+            if (!isSubscribed) setSubscriptionRevision((revision) => revision + 1);
             void refreshSessions();
           }}
           disabled={isLoadingSessions}
@@ -287,11 +358,23 @@ const ChatPanel: React.FC = () => {
       </div>
 
       <div className='border-b border-base-300 px-3 py-3 space-y-2'>
+        <label className='text-xs'>Connection
+          <select className='select select-bordered select-sm w-full' value={connection.mode} disabled={isSending}
+            onChange={(event) => setConnection({ ...connection, mode: event.target.value as 'local' | 'ssh' })}>
+            <option value='local'>Local</option><option value='ssh'>SSH</option>
+          </select>
+        </label>
+        {connection.mode === 'ssh' && <input key={connection.host} className='input input-bordered input-sm w-full'
+          aria-label='SSH host alias' placeholder='SSH host alias' defaultValue={connection.host} disabled={isSending}
+          onBlur={(event) => { if (event.target.value.trim() !== connection.host) setConnection({ ...connection, host: event.target.value.trim() }); }} />}
+        {isLoadingSessions && <p className='text-xs'>Connecting…</p>}
+        {isSending && preparation.current && <button className='btn btn-xs' onClick={cancelPreparation}>Cancel</button>}
         <label className='text-xs font-medium' htmlFor='pi-session-picker'>
           Pi session
         </label>
         <select
           id='pi-session-picker'
+          disabled={isSending}
           className='select select-bordered select-sm w-full text-xs'
           value={selectedSocketPath}
           onChange={(event) => {
@@ -326,13 +409,24 @@ const ChatPanel: React.FC = () => {
       </div>
 
       <div className='flex-1 overflow-y-auto px-3 py-3 space-y-3'>
+        {!bookKey && <p className='text-xs text-base-content/70'>Open Ask Pi from the document you want to discuss.</p>}
         {currentChapter && (
           <div className='text-xs text-base-content/50'>
             {currentChapter}
             {currentPage !== null ? ` · page ${currentPage}` : ''}
           </div>
         )}
-        {messages.map((message) => (
+        {messages.map((message) => message.role === 'user' ? (
+          <div key={message.id} className='ml-6 rounded-lg bg-primary/10 px-3 py-2 text-sm text-base-content break-words'>
+            <div className='mb-1 text-xs font-medium'>You</div>
+            {message.selectedText && (
+              <blockquote className='mb-2 border-l-2 border-primary/30 pl-2 text-xs italic whitespace-pre-wrap'>
+                {message.selectedText}
+              </blockquote>
+            )}
+            <div className='whitespace-pre-wrap'>{message.text}</div>
+          </div>
+        ) : (
           // Nested anchors retain native keyboard activation; this only redirects navigation.
           // eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions
           <div
@@ -372,6 +466,13 @@ const ChatPanel: React.FC = () => {
       </div>
 
       <div className='border-t border-base-300 px-3 py-2'>
+        {waitingSince !== null && (
+          <div role='status' className='mb-2 flex items-center gap-2 text-xs text-base-content/70'>
+            <span aria-hidden='true' className='loading loading-spinner loading-xs' />
+            <span>Waiting for the next Pi message…</span>
+            <span aria-live='off'>{waitingSeconds}s</span>
+          </div>
+        )}
         <div className='flex items-center gap-2 rounded-lg border border-base-300 bg-base-100 px-2 py-2 focus-within:border-primary'>
           <textarea
             ref={inputRef}
@@ -391,7 +492,7 @@ const ChatPanel: React.FC = () => {
             className='btn btn-xs btn-circle btn-primary'
             onClick={() => void handleSend()}
             disabled={
-              (!input.trim() && !pendingContext) || !selectedSession || !isSubscribed || isSending
+              !bookKey || (!input.trim() && !pendingContext) || !selectedSession || !isSubscribed || isSending
             }
             title={
               !selectedSession

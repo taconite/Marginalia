@@ -18,17 +18,23 @@ jobs:
       - name: Extract version from changelog
         id: version
         run: |
-          VERSION=$(sed -n 's/^## \[\([^]]*\)\].*/\1/p' CHANGELOG.md | head -1)
+          VERSION=$(awk '/^## \[(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\]/ { gsub(/[][]/, "", $2); print $2; exit }' CHANGELOG.md)
+          if [ -z "$VERSION" ]; then
+            echo "::error::No released version found in CHANGELOG.md"
+            exit 1
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
 
       - name: Extract changelog content
         id: changelog
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          CONTENT=$(awk '
+          CONTENT=$(awk -v version="$RELEASE_VERSION" '
             /^## \[/ {
               if (found) exit
-              found=1
+              found=($2 == "[" version "]")
               next
             }
             found { print }

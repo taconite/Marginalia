@@ -661,12 +661,13 @@ const Annotator: React.FC<{ bookKey: string }> = ({ bookKey }) => {
     }
 
     useChatStore.getState().setPendingContext({
+      bookKey,
       selectedText: selection.text,
       surroundingText,
       chapterTitle,
       bookTitle: book?.title || '',
       bookAuthor: book?.author || '',
-      page: progress?.page ?? null,
+      page: selection.page ?? null,
     });
     useChatStore.getState().setOpen(true);
   };
