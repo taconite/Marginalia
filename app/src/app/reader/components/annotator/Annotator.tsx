@@ -630,40 +630,9 @@ const Annotator: React.FC<{ bookKey: string }> = ({ bookKey }) => {
     // Get current chapter title from progress
     const chapterTitle = progress?.sectionLabel || '';
 
-    // Get surrounding text from the selection's section
-    let surroundingText = '';
-    try {
-      const view = getView(bookKey);
-      if (view && selection.range) {
-        const container = selection.range.commonAncestorContainer;
-        const parentEl = container.nodeType === Node.TEXT_NODE ? container.parentElement : container as Element;
-        if (parentEl) {
-          // Get a few sibling paragraphs for context
-          const siblings: string[] = [];
-          let el: Element | null = parentEl;
-          // Go back up to 3 siblings
-          for (let i = 0; i < 3 && el?.previousElementSibling; i++) {
-            el = el.previousElementSibling;
-            siblings.unshift(el.textContent?.trim() || '');
-          }
-          siblings.push(parentEl.textContent?.trim() || '');
-          el = parentEl;
-          // Go forward up to 3 siblings
-          for (let i = 0; i < 3 && el?.nextElementSibling; i++) {
-            el = el.nextElementSibling;
-            siblings.push(el.textContent?.trim() || '');
-          }
-          surroundingText = siblings.filter(Boolean).join('\n\n');
-        }
-      }
-    } catch {
-      // Surrounding text extraction is best-effort
-    }
-
     useChatStore.getState().setPendingContext({
       bookKey,
       selectedText: selection.text,
-      surroundingText,
       chapterTitle,
       bookTitle: book?.title || '',
       bookAuthor: book?.author || '',

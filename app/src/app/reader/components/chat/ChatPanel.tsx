@@ -121,6 +121,8 @@ const ChatPanel: React.FC = () => {
   const [isLoadingSessions, setIsLoadingSessions] = useState(false);
   const [subscribedSocketPath, setSubscribedSocketPath] = useState<string | null>(null);
   const activeSubscription = useRef<string | null>(null);
+  const introducedPdf = useRef<{ bookKey: string; subscriptionId: string } | null>(null);
+  useEffect(() => { introducedPdf.current = null; }, [bookKey]);
   const [isSending, setIsSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -247,7 +249,7 @@ const ChatPanel: React.FC = () => {
   const handleSend = async () => {
     if (!bookKey || !useReaderStore.getState().bookKeys.includes(bookKey) || (!input.trim() && !pendingContext) || !selectedSession || !isSubscribed || isSending) return;
 
-    const question = input.trim() || 'What does this passage mean?';
+    const question = input.trim() ? input : 'What does this passage mean?';
     const subscriptionId = activeSubscription.current;
     const operationId = crypto.randomUUID();
     preparation.current = operationId;
@@ -257,13 +259,15 @@ const ChatPanel: React.FC = () => {
     setError(null);
     setNotice(null);
     try {
-      const book = bookKey && useBookDataStore.getState().getBookData(bookKey)?.book;
-      if (!book) throw new Error('Unable to identify the document to send to Pi');
-      const progress = useReaderStore.getState().getProgress(bookKey);
-      const localPath = await resolveLocalPdfPath(await envConfig.getAppService(), book);
-      if (preparation.current !== operationId || !useReaderStore.getState().bookKeys.includes(bookKey)) return;
-      if (connection.mode === 'ssh' && localPath) setNotice('Checking PDF cache and transferring if needed…');
-      const pdfPath = await preparePiDocument(localPath, connection, operationId);
+      let pdfPath: string | undefined;
+      if (introducedPdf.current?.bookKey !== bookKey || introducedPdf.current.subscriptionId !== subscriptionId) {
+        const book = useBookDataStore.getState().getBookData(bookKey)?.book;
+        if (!book) throw new Error('Unable to identify the document to send to Pi');
+        const localPath = await resolveLocalPdfPath(await envConfig.getAppService(), book);
+        if (preparation.current !== operationId || !useReaderStore.getState().bookKeys.includes(bookKey)) return;
+        if (connection.mode === 'ssh' && localPath) setNotice('Checking PDF cache and transferring if needed…');
+        pdfPath = await preparePiDocument(localPath, connection, operationId);
+      }
       if (preparation.current !== operationId || useChatStore.getState().connection !== connection || !useReaderStore.getState().bookKeys.includes(bookKey)) return;
       if (useChatStore.getState().selectedSocketPath !== selectedSession.socketPath) return;
       if (!subscriptionId || activeSubscription.current !== subscriptionId) {
@@ -271,12 +275,8 @@ const ChatPanel: React.FC = () => {
       }
       const message = buildPiPrompt(question, {
         pdfPath,
-        bookTitle: pendingContext?.bookTitle || book.title,
-        bookAuthor: pendingContext?.bookAuthor || book.author,
-        chapterTitle: pendingContext?.chapterTitle ?? progress?.sectionLabel ?? '',
-        page: pendingContext?.page ?? progress?.page ?? null,
+        page: pendingContext?.page ?? null,
         selectedText: pendingContext?.selectedText || '',
-        surroundingText: pendingContext?.surroundingText || '',
       });
       setNotice(null);
       preparation.current = null;
@@ -288,6 +288,9 @@ const ChatPanel: React.FC = () => {
       };
       await sendPiPrompt(selectedSession.socketPath, message, connection);
       if (useChatStore.getState().connection !== connection || useChatStore.getState().selectedSocketPath !== selectedSession.socketPath) return;
+      if (pdfPath && activeSubscription.current === subscriptionId && useChatStore.getState().bookKey === bookKey) {
+        introducedPdf.current = { bookKey, subscriptionId };
+      }
       setMessages((current) => [...current, userMessage].sort((a, b) => a.id - b.id));
       setInput('');
       if (useChatStore.getState().pendingContext === pendingContext) setPendingContext(null);

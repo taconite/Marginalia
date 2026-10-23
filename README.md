@@ -10,8 +10,8 @@ A desktop ebook and PDF reader connected to an existing Pi session in Neovim.
 > book; from Latin marginalis, "of the margin."_
 
 This fork keeps Marginalia's document reader and annotation interface while
-moving agent conversations into Pi. Marginalia sends selected text and bounded
-reading context over pi.nvim's local Unix socket; Pi owns the conversation,
+moving agent conversations into Pi. Marginalia sends questions and selected text
+over pi.nvim's local Unix socket; Pi owns the conversation,
 model, tools, extensions, and responses.
 
 ## Features
@@ -27,8 +27,8 @@ Pi integration:
 
 - Select text and choose **Ask Pi**
 - Explicitly select a live Pi session by working directory and PID
-- Send the document title, author, section, page, selected text, surrounding
-  text, and question
+- Introduce the PDF path once, then send unselected questions verbatim
+- Include only the highlighted passage and its page with selected-text questions
 - Mirror Pi's assistant replies in the reading panel
 - Continue the same conversation in the existing Pi terminal in Neovim
 - Keep provider credentials and agent configuration out of Marginalia
@@ -49,9 +49,17 @@ Open the **Ask Pi** panel in Marginalia, refresh the session list, and select th
 intended session. Marginalia never falls back to a different session if that
 selection disconnects.
 
+For reading-specific instructions, start Pi with `--append-system-prompt` (the local
+`pi-reader` launcher uses this). Restart existing Pi processes to apply launcher
+changes; Marginalia no longer adds reading instructions to every question.
+
 ### Local PDF verification
 
-PDF questions include the readable local file path, including without a selection.
+The first question includes the readable PDF path. Later questions omit it until
+another document is selected, the reader restarts, or the Pi subscription reconnects.
+Hiding the panel or refreshing the session list without disconnecting keeps this state.
+An internal Pi conversation reset or external PDF replacement is not detected;
+reconnect to introduce the PDF again.
 Resolution failures leave the draft and selected text intact; no prompt is sent.
 For an isolated session, create and enter `/tmp/marginalia-local-verification`, then run:
 ```bash
@@ -72,7 +80,7 @@ Pi messages travel through native SSH forwarding; no Python helper is installed 
 In **Ask Pi**, choose **SSH**, enter the alias, then leave the field to connect.
 Select the remote session by working directory and PID. Local mode uses the original bridge.
 
-For each PDF question, Marginalia hashes the local file and checks the Ubuntu cache
+When introducing a PDF, Marginalia hashes the local file and checks the Ubuntu cache
 at `~/.cache/marginalia/pdfs/<sha256>.pdf`. It streams missing files over SSH using standard Ubuntu file commands and verifies
 their hash before publishing them. Cached PDFs are not retransferred; Pi receives
 the Ubuntu path. Closing the reader stops its SSH connections and leaves Pi running.

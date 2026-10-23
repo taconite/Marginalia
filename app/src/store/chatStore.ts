@@ -5,7 +5,6 @@ import type { PiConnection } from '@/services/pi/bridge';
 export interface ChatContext {
   bookKey: string;
   selectedText: string;
-  surroundingText: string;
   chapterTitle: string;
   bookTitle: string;
   bookAuthor: string;
